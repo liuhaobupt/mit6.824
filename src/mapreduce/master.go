@@ -29,6 +29,57 @@ func (mr *MapReduce) KillWorkers() *list.List {
 }
 
 func (mr *MapReduce) RunMaster() *list.List {
-	// Your code here
+  nMap := 0
+  nReduce := 0
+  var worker string
+
+  for {
+    select {
+    case  worker = <-mr.registerChannel:
+      fmt.Println("Register", worker)
+    case  worker = <-mr.doJobChannel:
+      fmt.Println("doJob", worker);
+    }
+
+    if nMap < mr.nMap {
+      go func() {
+        jobNumber := <-mr.jobNumberChannel
+        args := &DoJobArgs{}
+        args.File = mr.file
+        args.Operation = Map
+        args.JobNumber = jobNumber
+        args.NumOtherPhase = mr.nReduce
+
+        var reply DoJobReply
+        ok := call(worker, "Worker.DoJob", args, &reply)
+        if ok == false {
+          fmt.Printf("DoJob %s error", worker)
+        }
+        mr.doJobChannel <- worker
+      }()
+      mr.jobNumberChannel <- nMap
+      nMap += 1
+    } else if nReduce < mr.nReduce {
+      go func() {
+        jobNumber := <-mr.jobNumberChannel
+        args := &DoJobArgs{}
+        args.File = mr.file
+        args.Operation = Reduce
+        args.JobNumber = jobNumber
+        args.NumOtherPhase = mr.nMap
+
+        var reply DoJobReply
+        ok := call(worker, "Worker.DoJob", args, &reply)
+        if ok == false {
+          fmt.Printf("DoJob %s error", worker)
+        }
+        mr.doJobChannel <- worker
+      }()
+      mr.jobNumberChannel <- nReduce
+      nReduce += 1
+    } else {
+      break
+    }
+  }
 	return mr.KillWorkers()
 }
