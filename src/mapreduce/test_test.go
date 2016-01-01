@@ -12,7 +12,7 @@ import "sort"
 import "strconv"
 
 const (
-	nNumber = 100000
+	nNumber = 1000000
 	nMap    = 100
 	nReduce = 50
 )
@@ -136,7 +136,7 @@ func cleanup(mr *MapReduce) {
 func TestBasic(t *testing.T) {
 	fmt.Printf("Test: Basic mapreduce ...\n")
 	mr := setup()
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 10; i++ {
 		go RunWorker(mr.MasterAddress, port("worker"+strconv.Itoa(i)),
 			MapFunc, ReduceFunc, -1)
 	}
