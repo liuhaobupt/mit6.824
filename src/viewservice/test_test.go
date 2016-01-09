@@ -24,7 +24,7 @@ func check(t *testing.T, ck *Clerk, p string, b string, n uint) {
 }
 
 func port(suffix string) string {
-	s := "/var/tmp/824-"
+	s := "/data/10/xianlin.lh/var/tmp/824-"
 	s += strconv.Itoa(os.Getuid()) + "/"
 	os.Mkdir(s, 0777)
 	s += "viewserver-"

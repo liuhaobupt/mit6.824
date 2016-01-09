@@ -16,17 +16,52 @@ type ViewServer struct {
 	rpccount int32 // for testing
 	me       string
 
-
 	// Your declarations here.
+	current_view       View
+	server_info_map    map[string]time.Time
+	curr_primary_acked bool
+	is_inited          bool
 }
 
 //
 // server Ping RPC handler.
 //
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
-
-	// Your code here.
-
+	vs.mu.Lock()
+	if !vs.is_inited {
+		vs.current_view.Viewnum = 1
+		vs.current_view.Primary = args.Me
+		vs.current_view.Backup = ""
+		vs.is_inited = true
+	} else {
+		if vs.current_view.Primary == args.Me {
+			if vs.current_view.Viewnum == args.Viewnum {
+				vs.curr_primary_acked = true
+			} else {
+				if vs.curr_primary_acked {
+					vs.current_view.Viewnum = vs.current_view.Viewnum + 1
+					vs.current_view.Primary = vs.current_view.Backup
+					vs.current_view.Backup = ""
+					vs.curr_primary_acked = false
+				} else {
+					//	what the fuck
+				}
+			}
+		} else if vs.current_view.Backup == args.Me {
+			if vs.current_view.Viewnum == args.Viewnum {
+				// do nothing
+			} else {
+				//vs.current_view.Viewnum = vs.current_view.Viewnum + 1
+				//vs.current_view.Backup = ""
+				//vs.curr_primary_acked = false
+			}
+		} else {
+			// do nothing
+		}
+	}
+	vs.server_info_map[args.Me] = time.Now()
+	reply.View = vs.current_view
+	vs.mu.Unlock()
 	return nil
 }
 
@@ -34,12 +69,11 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 // server Get() RPC handler.
 //
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
-
-	// Your code here.
-
+	vs.mu.Lock()
+	reply.View = vs.current_view
+	vs.mu.Unlock()
 	return nil
 }
-
 
 //
 // tick() is called once per PingInterval; it should notice
@@ -47,8 +81,28 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 // accordingly.
 //
 func (vs *ViewServer) tick() {
-
-	// Your code here.
+	vs.mu.Lock()
+	if vs.curr_primary_acked && vs.is_inited {
+		primary_time, pok := vs.server_info_map[vs.current_view.Primary]
+		backup_time, bok := vs.server_info_map[vs.current_view.Backup]
+		if pok && (primary_time.Add(DeadPings * PingInterval).Before(time.Now())) {
+			vs.current_view.Viewnum = vs.current_view.Viewnum + 1
+			vs.current_view.Primary = vs.current_view.Backup
+			vs.current_view.Backup = ""
+			vs.curr_primary_acked = false
+		} else if pok && ((bok && backup_time.Add(DeadPings*PingInterval).Before(time.Now())) || !bok) {
+			new_back := ""
+			for k, v := range vs.server_info_map {
+				if k != vs.current_view.Primary && k != vs.current_view.Backup && (v.Add(DeadPings * PingInterval).After(time.Now())) {
+					new_back = k
+				}
+			}
+			vs.current_view.Viewnum = vs.current_view.Viewnum + 1
+			vs.current_view.Backup = new_back
+			vs.curr_primary_acked = false
+		}
+	}
+	vs.mu.Unlock()
 }
 
 //
@@ -76,7 +130,12 @@ func (vs *ViewServer) GetRPCCount() int32 {
 func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
-	// Your vs.* initializations here.
+	vs.current_view.Viewnum = 0
+	vs.current_view.Primary = ""
+	vs.current_view.Backup = ""
+	vs.server_info_map = make(map[string]time.Time)
+	vs.curr_primary_acked = false
+	vs.is_inited = false
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
