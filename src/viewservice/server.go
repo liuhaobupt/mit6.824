@@ -51,9 +51,13 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 			if vs.current_view.Viewnum == args.Viewnum {
 				// do nothing
 			} else {
-				//vs.current_view.Viewnum = vs.current_view.Viewnum + 1
-				//vs.current_view.Backup = ""
-				//vs.curr_primary_acked = false
+				if vs.curr_primary_acked {
+					vs.current_view.Viewnum = vs.current_view.Viewnum + 1
+					vs.current_view.Backup = ""
+					vs.curr_primary_acked = false
+				} else {
+					// what the fuck
+				}
 			}
 		} else {
 			// do nothing
