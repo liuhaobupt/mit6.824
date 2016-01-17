@@ -641,6 +641,7 @@ func TestConcurrentSameUnreliable(t *testing.T) {
 	}
 	view2, _ := vck.Get()
 	if view2.Primary != view1.Backup {
+		fmt.Println(view1, ".........", view2)
 		t.Fatal("wrong Primary")
 	}
 
