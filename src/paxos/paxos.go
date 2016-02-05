@@ -58,6 +58,8 @@ type Paxos struct {
 	acceptorInfo  map[int]AcceptorInfo
 	maxProposalId map[int]ProposalId
 	maxSeq        int
+	minSeq        int
+	doneInfo      map[string]int
 }
 
 type ProposalId struct {
@@ -92,7 +94,7 @@ type PrepareResp struct {
 	HasValue         bool
 	Rejected         bool
 
-	Decided	bool
+	Decided      bool
 	DecidedValue interface{}
 }
 
@@ -112,6 +114,14 @@ type DecidedArgs struct {
 }
 
 type DecidedResp struct {
+}
+
+type DoneArgs struct {
+	Peer string
+	Seq  int
+}
+
+type DoneResp struct {
 }
 
 //
@@ -246,16 +256,18 @@ func (px *Paxos) Start(seq int, v interface{}) {
 					proposerInfo.decided = true
 					px.proposerInfo[seq] = proposerInfo
 					for _, peer := range px.peers {
-						if _, ok = px.proposerInfo[seq].decidedResp[peer]; !ok {
-							args := &DecidedArgs{}
-							args.Seq = seq
-							args.DecidedValue = px.proposerInfo[seq].decidedValue
-							var reply DecidedResp
-							px.mu.Unlock()
-							ok = call(peer, "Paxos.Decided", args, &reply)
-							px.mu.Lock()
-							if ok {
-								px.proposerInfo[seq].decidedResp[peer] = true
+						if !px.isDecidedAll(seq) {
+							if _, ok = px.proposerInfo[seq].decidedResp[peer]; !ok {
+								args := &DecidedArgs{}
+								args.Seq = seq
+								args.DecidedValue = px.proposerInfo[seq].decidedValue
+								var reply DecidedResp
+								px.mu.Unlock()
+								ok = call(peer, "Paxos.Decided", args, &reply)
+								px.mu.Lock()
+								if ok && seq >= px.minSeq {
+									px.proposerInfo[seq].decidedResp[peer] = true
+								}
 							}
 						}
 					}
@@ -280,7 +292,7 @@ func (px *Paxos) isDecided(seq int) bool {
 }
 
 func (px *Paxos) isDecidedAll(seq int) bool {
-	return len(px.proposerInfo[seq].decidedResp) == px.peersNum
+	return seq < px.minSeq || len(px.proposerInfo[seq].decidedResp) == px.peersNum
 }
 
 func (px *Paxos) isPrepareMajority(seq int) bool {
@@ -386,7 +398,40 @@ func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedResp) error {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-	// Your code here.
+	args := &DoneArgs{}
+	args.Peer = px.peers[px.me]
+	args.Seq = seq
+	var reply DoneResp
+	for _, peer := range px.peers {
+		call(peer, "Paxos.DoneHandler", args, &reply)
+	}
+}
+
+func (px *Paxos) DoneHandler(args *DoneArgs, reply *DoneResp) error {
+	px.mu.Lock()
+	curMinSeq := px.minSeq
+	if peerMinSeq := px.doneInfo[args.Peer]; peerMinSeq < args.Seq {
+		px.doneInfo[args.Peer] = args.Seq
+	}
+	newMinSeq := px.newMinSeq()
+	for i := curMinSeq; i < newMinSeq; i++ {
+		delete(px.proposerInfo, i)
+		delete(px.acceptorInfo, i)
+		delete(px.maxProposalId, i)
+	}
+	px.minSeq = newMinSeq
+	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) newMinSeq() int {
+	minSeq := px.doneInfo[px.peers[px.me]] + 1
+	for _, v := range px.doneInfo {
+		if v+1 < minSeq {
+			minSeq = v + 1
+		}
+	}
+	return minSeq
 }
 
 //
@@ -402,7 +447,7 @@ func (px *Paxos) Max() int {
 //
 // Min() should return one more than the minimum among z_i,
 // where z_i is the highest number ever passed
-// to Done() on peer i. A peers z_i is -1 if it has
+// to ( on peer i. A peers z_i is -1 if it has
 // never called Done().
 //
 // Paxos is required to have forgotten all information
@@ -429,7 +474,7 @@ func (px *Paxos) Max() int {
 //
 func (px *Paxos) Min() int {
 	// You code here.
-	return 0
+	return px.minSeq
 }
 
 //
@@ -443,7 +488,9 @@ func (px *Paxos) Status(seq int) (Fate, interface{}) {
 	fate := Pending
 	var retValue interface{}
 	px.mu.Lock()
-	if px.isDecided(seq) {
+	if seq < px.minSeq {
+		fate = Forgotten
+	} else if px.isDecided(seq) {
 		fate = Decided
 		retValue = px.getDecidedValue(seq)
 	}
@@ -513,7 +560,11 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.acceptorInfo = make(map[int]AcceptorInfo)
 	px.maxProposalId = make(map[int]ProposalId)
 	px.maxSeq = 0
-
+	px.minSeq = 0
+	px.doneInfo = make(map[string]int)
+	for _, peer := range peers {
+		px.doneInfo[peer] = -1
+	}
 	if rpcs != nil {
 		// caller will create socket &c
 		rpcs.Register(px)
