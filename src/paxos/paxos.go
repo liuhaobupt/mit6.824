@@ -31,7 +31,6 @@ import "sync/atomic"
 import "fmt"
 import "math/rand"
 
-
 // px.Status() return values, indicating
 // whether an agreement has been decided,
 // or Paxos has not yet reached agreement,
@@ -53,8 +52,66 @@ type Paxos struct {
 	peers      []string
 	me         int // index into peers[]
 
-
 	// Your data here.
+	peersNum      int
+	proposerInfo  map[int]ProposerInfo
+	acceptorInfo  map[int]AcceptorInfo
+	maxProposalId map[int]ProposalId
+	maxSeq        int
+}
+
+type ProposalId struct {
+	S    int64
+	Addr string
+}
+
+type ProposerInfo struct {
+	proposalValue interface{}
+	prepareResp   map[string]PrepareResp
+	decidedValue  interface{}
+	acceptResp    map[string]bool
+	decided       bool
+	decidedResp   map[string]bool
+}
+
+type AcceptorInfo struct {
+	acceptProposalId ProposalId
+	acceptValue      interface{}
+	decidedValue     interface{}
+	decided          bool
+}
+
+type PrepareArgs struct {
+	Seq        int
+	ProposalId ProposalId
+}
+
+type PrepareResp struct {
+	AcceptProposalId ProposalId
+	AcceptValue      interface{}
+	HasValue         bool
+	Rejected         bool
+
+	Decided	bool
+	DecidedValue interface{}
+}
+
+type AcceptArgs struct {
+	Seq          int
+	ProposalId   ProposalId
+	DecidedValue interface{}
+}
+
+type AcceptResp struct {
+	Rejected bool
+}
+
+type DecidedArgs struct {
+	Seq          int
+	DecidedValue interface{}
+}
+
+type DecidedResp struct {
 }
 
 //
@@ -93,7 +150,6 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-
 //
 // the application wants paxos to start agreement on
 // instance seq, with proposed value v.
@@ -103,6 +159,224 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
+	px.mu.Lock()
+	if seq > px.maxSeq {
+		px.maxSeq = seq
+	}
+	decided := px.isDecided(seq)
+	var maxProposalId ProposalId
+	if !decided {
+		maxProposalId = px.maxProposalId[seq]
+		maxProposalId.S = maxProposalId.S + 1
+		maxProposalId.Addr = px.peers[px.me]
+		px.maxProposalId[seq] = maxProposalId
+		var proposerInfo ProposerInfo
+		proposerInfo.proposalValue = v
+		proposerInfo.prepareResp = make(map[string]PrepareResp)
+		proposerInfo.acceptResp = make(map[string]bool)
+		proposerInfo.decidedResp = make(map[string]bool)
+		px.proposerInfo[seq] = proposerInfo
+	}
+	px.mu.Unlock()
+
+	if !decided {
+		go func() {
+			for {
+				px.mu.Lock()
+				var rejected bool
+				var ok bool
+				if !px.isPrepareMajority(seq) {
+					for _, peer := range px.peers {
+						if _, ok = px.proposerInfo[seq].prepareResp[peer]; !ok {
+							args := &PrepareArgs{}
+							args.ProposalId = maxProposalId
+							args.Seq = seq
+							var reply PrepareResp
+							px.mu.Unlock()
+							ok = call(peer, "Paxos.Prepare", args, &reply)
+							px.mu.Lock()
+							if ok {
+								rejected = reply.Rejected
+								if rejected {
+									proposerInfo := px.proposerInfo[seq]
+									proposerInfo.decided = reply.Decided
+									//px.proposerInfo[seq].decided = reply.Decided
+									if reply.Decided {
+										proposerInfo.decidedValue = reply.DecidedValue
+									}
+									px.proposerInfo[seq] = proposerInfo
+									break
+								} else {
+									px.proposerInfo[seq].prepareResp[peer] = reply
+								}
+							}
+						}
+					}
+				}
+
+				if !rejected && px.isPrepareMajority(seq) && !px.isAcceptMajority(seq) {
+					proposerInfo := px.proposerInfo[seq]
+					proposerInfo.decidedValue = px.decidedValue(seq)
+					px.proposerInfo[seq] = proposerInfo
+					for _, peer := range px.peers {
+						if _, ok = px.proposerInfo[seq].acceptResp[peer]; !ok {
+							args := &AcceptArgs{}
+							args.Seq = seq
+							args.ProposalId = maxProposalId
+							args.DecidedValue = px.proposerInfo[seq].decidedValue
+							var reply AcceptResp
+							px.mu.Unlock()
+							ok = call(peer, "Paxos.Accept", args, &reply)
+							px.mu.Lock()
+							if ok {
+								rejected = reply.Rejected
+								if rejected {
+									break
+								} else {
+									px.proposerInfo[seq].acceptResp[peer] = true
+								}
+							}
+						}
+					}
+				}
+
+				if !rejected && px.isAcceptMajority(seq) && !px.isDecidedAll(seq) {
+					//fmt.Println("acceptResp", px.proposerInfo[seq])
+					proposerInfo := px.proposerInfo[seq]
+					proposerInfo.decided = true
+					px.proposerInfo[seq] = proposerInfo
+					for _, peer := range px.peers {
+						if _, ok = px.proposerInfo[seq].decidedResp[peer]; !ok {
+							args := &DecidedArgs{}
+							args.Seq = seq
+							args.DecidedValue = px.proposerInfo[seq].decidedValue
+							var reply DecidedResp
+							px.mu.Unlock()
+							ok = call(peer, "Paxos.Decided", args, &reply)
+							px.mu.Lock()
+							if ok {
+								px.proposerInfo[seq].decidedResp[peer] = true
+							}
+						}
+					}
+				}
+
+				decidedAll := px.isDecidedAll(seq)
+				px.mu.Unlock()
+				if decidedAll || rejected {
+					break
+				}
+			}
+		}()
+	}
+}
+
+func (px *Paxos) isDecided(seq int) bool {
+	_, pOK := px.proposerInfo[seq]
+	_, aOK := px.acceptorInfo[seq]
+	decided := (pOK && px.proposerInfo[seq].decided) ||
+		(aOK && px.acceptorInfo[seq].decided)
+	return decided
+}
+
+func (px *Paxos) isDecidedAll(seq int) bool {
+	return len(px.proposerInfo[seq].decidedResp) == px.peersNum
+}
+
+func (px *Paxos) isPrepareMajority(seq int) bool {
+	return len(px.proposerInfo[seq].prepareResp) > px.peersNum/2
+}
+
+func (px *Paxos) isAcceptMajority(seq int) bool {
+	return len(px.proposerInfo[seq].acceptResp) > px.peersNum/2
+}
+
+func (px *Paxos) decidedValue(seq int) interface{} {
+	decidedValue := px.proposerInfo[seq].proposalValue
+	var curProposalID ProposalId
+	for _, prepareResp := range px.proposerInfo[seq].prepareResp {
+		if prepareResp.HasValue && ProposalIDGreater(prepareResp.AcceptProposalId, curProposalID) {
+			curProposalID = prepareResp.AcceptProposalId
+			decidedValue = prepareResp.AcceptValue
+		}
+	}
+	return decidedValue
+}
+
+func ProposalIDGreater(a ProposalId, b ProposalId) bool {
+	if a.S > b.S {
+		return true
+	} else if a.S == b.S {
+		return a.Addr > b.Addr
+	} else {
+		return false
+	}
+}
+
+func ProposalIDGreaterEqual(a ProposalId, b ProposalId) bool {
+	if a.S > b.S {
+		return true
+	} else if a.S == b.S {
+		return a.Addr >= b.Addr
+	} else {
+		return false
+	}
+}
+
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareResp) error {
+	px.mu.Lock()
+	seq := args.Seq
+	proposalId := args.ProposalId
+	if ProposalIDGreaterEqual(proposalId, px.maxProposalId[seq]) {
+		px.maxProposalId[seq] = proposalId
+		reply.Rejected = false
+		_, ok := px.acceptorInfo[seq]
+		if !ok {
+			reply.HasValue = false
+		} else {
+			reply.HasValue = true
+			reply.AcceptProposalId = px.acceptorInfo[seq].acceptProposalId
+			reply.AcceptValue = px.acceptorInfo[seq].acceptValue
+		}
+	} else {
+		reply.Rejected = true
+		_, ok := px.acceptorInfo[seq]
+		if ok {
+			reply.Decided = px.acceptorInfo[seq].decided
+			reply.DecidedValue = px.acceptorInfo[seq].decidedValue
+		}
+	}
+	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptResp) error {
+	px.mu.Lock()
+	seq := args.Seq
+	proposalId := args.ProposalId
+	if ProposalIDGreaterEqual(proposalId, px.maxProposalId[seq]) {
+		px.maxProposalId[seq] = proposalId
+		reply.Rejected = false
+		acceptorInfo := px.acceptorInfo[seq]
+		acceptorInfo.acceptProposalId = proposalId
+		acceptorInfo.acceptValue = args.DecidedValue
+		px.acceptorInfo[seq] = acceptorInfo
+	} else {
+		reply.Rejected = true
+	}
+	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedResp) error {
+	px.mu.Lock()
+	seq := args.Seq
+	acceptorInfo := px.acceptorInfo[seq]
+	acceptorInfo.decided = true
+	acceptorInfo.decidedValue = args.DecidedValue
+	px.acceptorInfo[seq] = acceptorInfo
+	px.mu.Unlock()
+	return nil
 }
 
 //
@@ -122,7 +396,7 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
 	// Your code here.
-	return 0
+	return px.maxSeq
 }
 
 //
@@ -166,11 +440,30 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
-	// Your code here.
-	return Pending, nil
+	fate := Pending
+	var retValue interface{}
+	px.mu.Lock()
+	if px.isDecided(seq) {
+		fate = Decided
+		retValue = px.getDecidedValue(seq)
+	}
+	px.mu.Unlock()
+	return fate, retValue
 }
 
-
+func (px *Paxos) getDecidedValue(seq int) interface{} {
+	_, pOK := px.proposerInfo[seq]
+	if pOK && px.proposerInfo[seq].decided {
+		//fmt.Println("proposerInfo", px.proposerInfo[seq].decidedValue)
+		return px.proposerInfo[seq].decidedValue
+	}
+	_, aOK := px.acceptorInfo[seq]
+	if aOK && px.acceptorInfo[seq].decided {
+		//fmt.Println("acceptorInfo", px.acceptorInfo[seq].decidedValue)
+		return px.acceptorInfo[seq].decidedValue
+	}
+	return nil
+}
 
 //
 // tell the peer to shut itself down.
@@ -214,8 +507,12 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.peers = peers
 	px.me = me
 
-
 	// Your initialization code here.
+	px.peersNum = len(peers)
+	px.proposerInfo = make(map[int]ProposerInfo)
+	px.acceptorInfo = make(map[int]AcceptorInfo)
+	px.maxProposalId = make(map[int]ProposalId)
+	px.maxSeq = 0
 
 	if rpcs != nil {
 		// caller will create socket &c
@@ -267,7 +564,6 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 			}
 		}()
 	}
-
 
 	return px
 }
