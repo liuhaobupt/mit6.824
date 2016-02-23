@@ -5,6 +5,7 @@ import "crypto/rand"
 import "math/big"
 
 import "fmt"
+import "time"
 
 type Clerk struct {
 	servers []string
@@ -65,8 +66,25 @@ func call(srv string, rpcname string,
 // keeps trying forever in the face of all other errors.
 //
 func (ck *Clerk) Get(key string) string {
-	// You will have to modify this function.
-	return ""
+	var ret_value string
+	args := &GetArgs{}
+	args.Key = key
+	args.RpcId = nrand()
+	var reply GetReply
+	index := 0
+	for {
+		replica := ck.servers[index%len(ck.servers)]
+		ok := call(replica, "KVPaxos.Get", args, &reply)
+		if ok {
+			if reply.Err == OK {
+				ret_value = reply.Value
+			}
+			break
+		}
+		time.Sleep(time.Second)
+		index++
+	}
+	return ret_value
 }
 
 //
@@ -74,6 +92,22 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := &PutAppendArgs{}
+	args.Key = key
+	args.Value = value
+	args.Op = op
+	args.RpcId = nrand()
+	var reply PutAppendReply
+	index := 0
+	for {
+		replica := ck.servers[index%len(ck.servers)]
+		ok := call(replica, "KVPaxos.PutAppend", args, &reply)
+		if ok && reply.Err == OK {
+			break
+		}
+		time.Sleep(time.Second)
+		index++
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

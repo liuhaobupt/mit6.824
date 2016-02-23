@@ -170,6 +170,13 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
 	px.mu.Lock()
+	defer px.mu.Unlock()
+	if seq < px.minSeq {
+		return
+	}
+	if _, ok := px.proposerInfo[seq]; ok {
+		return
+	}
 	if seq > px.maxSeq {
 		px.maxSeq = seq
 	}
@@ -187,14 +194,17 @@ func (px *Paxos) Start(seq int, v interface{}) {
 		proposerInfo.decidedResp = make(map[string]bool)
 		px.proposerInfo[seq] = proposerInfo
 	}
-	px.mu.Unlock()
 
 	if !decided {
 		go func() {
+			px.mu.Lock()
+		Exit:
 			for {
-				px.mu.Lock()
 				var rejected bool
 				var ok bool
+				if seq < px.minSeq {
+					break Exit
+				}
 				if !px.isPrepareMajority(seq) {
 					for _, peer := range px.peers {
 						if _, ok = px.proposerInfo[seq].prepareResp[peer]; !ok {
@@ -202,9 +212,17 @@ func (px *Paxos) Start(seq int, v interface{}) {
 							args.ProposalId = maxProposalId
 							args.Seq = seq
 							var reply PrepareResp
-							px.mu.Unlock()
-							ok = call(peer, "Paxos.Prepare", args, &reply)
-							px.mu.Lock()
+							if peer != px.peers[px.me] {
+								px.mu.Unlock()
+								ok = call(peer, "Paxos.Prepare", args, &reply)
+								px.mu.Lock()
+								if seq < px.minSeq {
+									break Exit
+								}
+							} else {
+								ok = true
+								px.prepareUnlock(args, &reply)
+							}
 							if ok {
 								rejected = reply.Rejected
 								if rejected {
@@ -235,9 +253,17 @@ func (px *Paxos) Start(seq int, v interface{}) {
 							args.ProposalId = maxProposalId
 							args.DecidedValue = px.proposerInfo[seq].decidedValue
 							var reply AcceptResp
-							px.mu.Unlock()
-							ok = call(peer, "Paxos.Accept", args, &reply)
-							px.mu.Lock()
+							if peer != px.peers[px.me] {
+								px.mu.Unlock()
+								ok = call(peer, "Paxos.Accept", args, &reply)
+								px.mu.Lock()
+								if seq < px.minSeq {
+									break Exit
+								}
+							} else {
+								ok = true
+								px.acceptUnlock(args, &reply)
+							}
 							if ok {
 								rejected = reply.Rejected
 								if rejected {
@@ -262,9 +288,17 @@ func (px *Paxos) Start(seq int, v interface{}) {
 								args.Seq = seq
 								args.DecidedValue = px.proposerInfo[seq].decidedValue
 								var reply DecidedResp
-								px.mu.Unlock()
-								ok = call(peer, "Paxos.Decided", args, &reply)
-								px.mu.Lock()
+								if peer != px.peers[px.me] {
+									px.mu.Unlock()
+									ok = call(peer, "Paxos.Decided", args, &reply)
+									px.mu.Lock()
+									if seq < px.minSeq {
+										break Exit
+									}
+								} else {
+									ok = true
+									px.decidedUnlock(args, &reply)
+								}
 								if ok && seq >= px.minSeq {
 									px.proposerInfo[seq].decidedResp[peer] = true
 								}
@@ -274,11 +308,11 @@ func (px *Paxos) Start(seq int, v interface{}) {
 				}
 
 				decidedAll := px.isDecidedAll(seq)
-				px.mu.Unlock()
 				if decidedAll || rejected {
-					break
+					break Exit
 				}
 			}
+			px.mu.Unlock()
 		}()
 	}
 }
@@ -334,10 +368,18 @@ func ProposalIDGreaterEqual(a ProposalId, b ProposalId) bool {
 		return false
 	}
 }
-
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareResp) error {
 	px.mu.Lock()
+	px.prepareUnlock(args, reply)
+	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) prepareUnlock(args *PrepareArgs, reply *PrepareResp) {
 	seq := args.Seq
+	if seq > px.maxSeq {
+		px.maxSeq = seq
+	}
 	proposalId := args.ProposalId
 	if ProposalIDGreaterEqual(proposalId, px.maxProposalId[seq]) {
 		px.maxProposalId[seq] = proposalId
@@ -358,13 +400,20 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareResp) error {
 			reply.DecidedValue = px.acceptorInfo[seq].decidedValue
 		}
 	}
-	px.mu.Unlock()
-	return nil
+	return
 }
 
 func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptResp) error {
 	px.mu.Lock()
+	px.acceptUnlock(args, reply)
+	px.mu.Unlock()
+	return nil
+}
+func (px *Paxos) acceptUnlock(args *AcceptArgs, reply *AcceptResp) {
 	seq := args.Seq
+	if seq > px.maxSeq {
+		px.maxSeq = seq
+	}
 	proposalId := args.ProposalId
 	if ProposalIDGreaterEqual(proposalId, px.maxProposalId[seq]) {
 		px.maxProposalId[seq] = proposalId
@@ -376,19 +425,26 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptResp) error {
 	} else {
 		reply.Rejected = true
 	}
-	px.mu.Unlock()
-	return nil
+	return
 }
 
 func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedResp) error {
 	px.mu.Lock()
+	px.decidedUnlock(args, reply)
+	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) decidedUnlock(args *DecidedArgs, reply *DecidedResp) {
 	seq := args.Seq
+	if seq > px.maxSeq {
+		px.maxSeq = seq
+	}
 	acceptorInfo := px.acceptorInfo[seq]
 	acceptorInfo.decided = true
 	acceptorInfo.decidedValue = args.DecidedValue
 	px.acceptorInfo[seq] = acceptorInfo
-	px.mu.Unlock()
-	return nil
+	return
 }
 
 //
@@ -425,6 +481,9 @@ func (px *Paxos) DoneHandler(args *DoneArgs, reply *DoneResp) error {
 }
 
 func (px *Paxos) newMinSeq() int {
+	// maybe 这里需要判断本地这个seq是否已经decided，再计算min
+	// 外部调用，有可能在一个instance未decided时即调用Done，这里不做判断的话，
+	// 有可能在Start goroutine中会panic（因为一个未decided的instance由于外部调用Done而delete）
 	minSeq := px.doneInfo[px.peers[px.me]] + 1
 	for _, v := range px.doneInfo {
 		if v+1 < minSeq {

@@ -11,7 +11,7 @@ import "os"
 import "syscall"
 import "encoding/gob"
 import "math/rand"
-
+import "time"
 
 const Debug = 0
 
@@ -22,11 +22,16 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key   string
+	Value string
+	Op    string
+	Me    int
+	Id    int
+	RpcId int64
 }
 
 type KVPaxos struct {
@@ -38,17 +43,115 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
+	applyPoint int
+	identity   int
+	data       map[string]string
+	rpcIds     map[int64]bool
 }
 
+func (kv *KVPaxos) makeOp(key string, value string, rpc_id int64, op_arg string) Op {
+	var op Op
+	op.Key = key
+	op.Value = value
+	op.RpcId = rpc_id
+	op.Op = op_arg
+	op.Me = kv.me
+	op.Id = kv.identity
+	return op
+}
+
+func (kv *KVPaxos) getStatus(seq int) (interface{}, paxos.Fate) {
+	to := 10 * time.Millisecond
+	retry := 0
+	for {
+		retry++
+		status, result := kv.px.Status(seq)
+		if status == paxos.Decided || status == paxos.Forgotten {
+			return result, status
+		}
+		time.Sleep(to)
+		if retry == 10 {
+			op := kv.makeOp("", "", 0, "Query")
+			kv.px.Start(seq, op)
+		}
+	}
+}
+
+func (kv *KVPaxos) apply(op Op) {
+	if op.Op != "Get" && op.Op != "Query" {
+		_, ok := kv.rpcIds[op.RpcId]
+		if !ok {
+			tmp_value := ""
+			if op.Op == "Append" {
+				tmp_value = kv.data[op.Key]
+			}
+			tmp_value = tmp_value + op.Value
+			kv.data[op.Key] = tmp_value
+			kv.rpcIds[op.RpcId] = true
+		}
+	}
+	kv.applyPoint++
+}
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
+	for {
+		kv.mu.Lock()
+		op := kv.makeOp(args.Key, "", args.RpcId, "Get")
+		kv.identity++
+		kv.mu.Unlock()
+
+		seq := kv.px.Max() + 1
+		kv.px.Start(seq, op)
+
+		result, status := kv.getStatus(seq)
+
+		if status == paxos.Decided && result.(Op).Me == op.Me && result.(Op).Id == op.Id {
+			kv.mu.Lock()
+			for kv.applyPoint < seq {
+				dst_apply := kv.applyPoint + 1
+				dst_op, _ := kv.getStatus(dst_apply)
+				kv.apply(dst_op.(Op))
+			}
+			value, ok := kv.data[op.Key]
+			if ok {
+				reply.Value = value
+				reply.Err = OK
+			} else {
+				reply.Err = ErrNoKey
+			}
+			done_point := kv.applyPoint
+			kv.mu.Unlock()
+			kv.px.Done(done_point)
+			break
+		}
+	}
 	return nil
 }
 
 func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	// Your code here.
+	for {
+		kv.mu.Lock()
+		op := kv.makeOp(args.Key, args.Value, args.RpcId, args.Op)
+		kv.identity++
+		kv.mu.Unlock()
 
+		seq := kv.px.Max() + 1
+		kv.px.Start(seq, op)
+
+		result, status := kv.getStatus(seq)
+
+		if status == paxos.Decided && result.(Op).Me == op.Me && result.(Op).Id == op.Id {
+			kv.mu.Lock()
+			if kv.applyPoint+1 == seq {
+				kv.apply(op)
+			}
+			done_point := kv.applyPoint
+			kv.mu.Unlock()
+			kv.px.Done(done_point)
+			reply.Err = OK
+			break
+		}
+	}
 	return nil
 }
 
@@ -92,6 +195,10 @@ func StartServer(servers []string, me int) *KVPaxos {
 
 	kv := new(KVPaxos)
 	kv.me = me
+	kv.applyPoint = 0
+	kv.identity = 0
+	kv.data = make(map[string]string)
+	kv.rpcIds = make(map[int64]bool)
 
 	// Your initialization code here.
 
@@ -106,7 +213,6 @@ func StartServer(servers []string, me int) *KVPaxos {
 		log.Fatal("listen error: ", e)
 	}
 	kv.l = l
-
 
 	// please do not change any of the following code,
 	// or do anything to subvert it.
